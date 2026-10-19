@@ -1,0 +1,50 @@
+# AdaSMamba H36M Training Configuration
+# Based on SasMamba config, extended with AdaSMamba-specific options
+
+# Training
+new-checkpoint: checkpoint/36m/AdaSMamba_243/
+learning_rate: 0.0005
+batch_size: 16
+weight_decay: 0.01
+lr_decay: 0.99
+epochs: 300
+train_2d: False
+
+# Model
+model_name: AdaSMamba
+n_layers: 5
+dim_feat: 64
+n_frames: 243
+mlp_ratio: 2.0
+ssm_conv: 7
+
+# AdaSMamba-specific options
+use_adaptive_scan: True      # Innovation 1: Adaptive Scan Path
+use_structure_gate: True     # Innovation 2: Structure-Gated SSM
+use_adaptive_scale: False    # Innovation 3: Adaptive Multi-Scale Fusion (optional)
+num_candidate_paths: 4       # Number of candidate scan paths (K)
+
+# Data
+data_root: data/motion3d/
+data_root_2d: data/motion2d/
+subset_list: [ H36M-243 ]
+dt_file: h36m_sh_conf_cam_source_final.pkl
+num_joints: 17
+root_rel: True
+add_velocity: False
+
+# Loss
+lambda_3d_velocity: 20.0
+lambda_scale: 0.5
+lambda_lv: 0.0
+lambda_lg: 0.0
+lambda_a: 0.0
+lambda_av: 0.0
+lambda_mi: 0.001
+lambda_3dw: 0.0
+lambda_3d: 1.0
+lambda_diff: 0.5
+
+# Augmentation
+use_proj_as_2d: False   # True for GT
+flip: True
