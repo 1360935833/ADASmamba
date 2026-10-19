@@ -29,9 +29,10 @@ class StructureEncoder(nn.Module):
         super().__init__()
         self.num_joints = num_joints
         self.struct_dim = struct_dim
+        self.component_dim = struct_dim // 4
 
         # Static skeleton attribute embeddings
-        self.joint_type_embed = nn.Parameter(torch.randn(1, 1, num_joints, struct_dim // 4))
+        self.joint_type_embed = nn.Parameter(torch.randn(1, 1, num_joints, self.component_dim))
 
         # Learnable limb group embedding (5 groups: torso, left arm, right arm, left leg, right leg)
         # Human3.6M joint groups:
@@ -57,7 +58,7 @@ class StructureEncoder(nn.Module):
             2,  # r_elbow -> right arm
             2,  # r_wrist -> right arm
         ], dtype=torch.long))
-        self.limb_embed = nn.Embedding(5, struct_dim // 4)
+        self.limb_embed = nn.Embedding(5, self.component_dim)
 
         # Tree depth embedding (root=0, leaf=3)
         self.register_buffer('tree_depth', torch.tensor([
@@ -79,16 +80,16 @@ class StructureEncoder(nn.Module):
             3,  # r_elbow
             3,  # r_wrist
         ], dtype=torch.long))
-        self.depth_embed = nn.Embedding(4, struct_dim // 4)
+        self.depth_embed = nn.Embedding(4, self.component_dim)
 
         # Dynamic motion projector
-        self.motion_proj = nn.Linear(6, struct_dim // 4)  # vel(2) + acc(2) + parent_rel(2)
+        self.motion_proj = nn.Linear(6, self.component_dim)  # vel(2) + acc(2) + parent_rel(2)
 
         # Scan context projector
-        self.scan_ctx_proj = nn.Linear(3, struct_dim // 4)  # same_limb, tree_dist, is_parent_child
+        self.scan_ctx_proj = nn.Linear(3, self.component_dim)  # same_limb, tree_dist, is_parent_child
 
         # Fusion layer
-        self.fusion = nn.Linear(struct_dim, struct_dim)
+        self.fusion = nn.Linear(3 * self.component_dim, struct_dim)
 
     def get_scan_context(self, scan_indices, num_joints):
         """Compute scan context: relationship between consecutive joints in scan order.
@@ -98,7 +99,8 @@ class StructureEncoder(nn.Module):
             num_joints: int
 
         Returns:
-            ctx: [B, W, 3] with (same_limb, tree_dist_norm, is_parent_child)
+            ctx: [B, W, 3] in original joint order, with
+                (same_limb, tree_dist_norm, is_parent_child)
         """
         if scan_indices.dim() == 1:
             scan_indices = scan_indices.unsqueeze(0)  # [1, W]
@@ -125,27 +127,30 @@ class StructureEncoder(nn.Module):
                 if parent_map.get(cur) == prev or parent_map.get(prev) == cur:
                     is_parent[b, w] = 1.0
 
-        ctx = torch.stack([same_limb, tree_dist, is_parent], dim=-1)  # [B, W, 3]
+        ctx_in_scan_order = torch.stack([same_limb, tree_dist, is_parent], dim=-1)  # [B, W, 3]
+        ctx = torch.zeros_like(ctx_in_scan_order)
+        scatter_idx = scan_indices.unsqueeze(-1).expand_as(ctx_in_scan_order)
+        ctx.scatter_(1, scatter_idx, ctx_in_scan_order)
         return ctx
 
     def forward(self, x, scan_indices=None):
-        # x: [B, F, N, C] or [B, N, F, C]
-        B, F, N, C = x.shape
+        # x: [B, F, N, C] latent joint features
+        batch_size, num_frames, num_joints, channels = x.shape
 
         # Static encoding
-        limb_emb = self.limb_embed(self.limb_group[:N])  # [N, D/4]
-        depth_emb = self.depth_embed(self.tree_depth[:N])  # [N, D/4]
-        static_enc = (self.joint_type_embed[:, :, :N, :] +
+        limb_emb = self.limb_embed(self.limb_group[:num_joints])  # [N, D/4]
+        depth_emb = self.depth_embed(self.tree_depth[:num_joints])  # [N, D/4]
+        static_enc = (self.joint_type_embed[:, :, :num_joints, :] +
                       limb_emb.unsqueeze(0).unsqueeze(0) +
                       depth_emb.unsqueeze(0).unsqueeze(0))  # [1, 1, N, D/4]
 
         # Dynamic encoding: velocity, acceleration, parent-relative
-        if F > 1:
+        if num_frames > 1:
             vel = x[:, 1:] - x[:, :-1]  # [B, F-1, N, C]
             vel = F.pad(vel, (0, 0, 0, 0, 1, 0))  # [B, F, N, C]
-            if F > 2:
-                acc = vel[:, 1:] - vel[:, :-1]  # [B, F-2, N, C]
-                acc = F.pad(acc, (0, 0, 0, 0, 1, 1))
+            if num_frames > 2:
+                acc = vel[:, 1:] - vel[:, :-1]  # [B, F-1, N, C]
+                acc = F.pad(acc, (0, 0, 0, 0, 1, 0))  # [B, F, N, C]
             else:
                 acc = torch.zeros_like(vel)
         else:
@@ -155,24 +160,30 @@ class StructureEncoder(nn.Module):
         # Parent-relative (simplified: use parent joint index 0 as reference)
         parent_rel = x - x[:, :, 0:1, :]  # relative to hip
 
-        # Take first 2 dims of each (x, y for 2D input)
-        vel_xy = vel[..., :2] if C >= 2 else torch.zeros(B, F, N, 2, device=x.device)
-        acc_xy = acc[..., :2] if C >= 2 else torch.zeros(B, F, N, 2, device=x.device)
-        pr_xy = parent_rel[..., :2] if C >= 2 else torch.zeros(B, F, N, 2, device=x.device)
+        # Project the first two latent feature channels from each motion signal
+        vel_xy = vel[..., :2] if channels >= 2 else torch.zeros(
+            batch_size, num_frames, num_joints, 2, device=x.device, dtype=x.dtype)
+        acc_xy = acc[..., :2] if channels >= 2 else torch.zeros(
+            batch_size, num_frames, num_joints, 2, device=x.device, dtype=x.dtype)
+        pr_xy = parent_rel[..., :2] if channels >= 2 else torch.zeros(
+            batch_size, num_frames, num_joints, 2, device=x.device, dtype=x.dtype)
 
         motion_enc = self.motion_proj(torch.cat([vel_xy, acc_xy, pr_xy], dim=-1))  # [B, F, N, D/4]
 
         # Scan context encoding
         if scan_indices is not None:
-            scan_ctx = self.get_scan_context(scan_indices, N)  # [B, N, 3]
-            scan_ctx = F.pad(scan_ctx.unsqueeze(1), (0, 0, 0, 0, 0, 0))  # [B, 1, N, 3]
-            scan_ctx = scan_ctx.expand(B, F, N, 3)
+            scan_ctx = self.get_scan_context(scan_indices, num_joints)  # [B, N, 3]
+            scan_ctx = scan_ctx.unsqueeze(1).expand(batch_size, num_frames, num_joints, 3)
             scan_enc = self.scan_ctx_proj(scan_ctx)  # [B, F, N, D/4]
         else:
-            scan_enc = torch.zeros(B, F, N, self.struct_dim // 4, device=x.device)
+            scan_enc = torch.zeros(
+                batch_size, num_frames, num_joints, self.component_dim,
+                device=x.device, dtype=x.dtype)
 
         # Concatenate and fuse
-        struct_enc = torch.cat([static_enc.expand(B, F, -1, -1), motion_enc, scan_enc], dim=-1)
+        struct_enc = torch.cat([
+            static_enc.expand(batch_size, num_frames, -1, -1), motion_enc, scan_enc
+        ], dim=-1)
         struct_enc = self.fusion(struct_enc)  # [B, F, N, struct_dim]
 
         return struct_enc

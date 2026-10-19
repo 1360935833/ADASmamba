@@ -174,7 +174,6 @@ class AdaSMambaBlock(nn.Module):
 
         # --- Innovation 1: Adaptive Scan Path ---
         scan_indices = None
-        path_weights = None
         if self.path_generator is not None:
             scan_indices, path_weights, _ = self.path_generator(x)
 
@@ -184,10 +183,12 @@ class AdaSMambaBlock(nn.Module):
         # --- SSM processing (inner BiSTSSMBlock) ---
         # The SSM scans the reordered joints in sequence
         x_ssm = self.ssm_block.op(self.ssm_block.norm(x))
+        if scan_indices is not None:
+            x_ssm = self._reorder_joints(x_ssm, scan_indices, inverse=True)
 
         # --- Innovation 2: Structure Gate ---
         if self.structure_gate is not None:
-            # Use the pre-reorder residual for gating
+            # Gate tensors after restoring the SSM output to canonical joint order.
             x_gated = self.structure_gate(x_ssm, residual, scan_indices)
         else:
             x_gated = x_ssm + residual
